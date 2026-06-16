@@ -1,5 +1,5 @@
 # %% [code]
-# Version 14 - MERT + X-Vector (Chitra's Model Feature Combination)
+# Version 15 - MERT + Pitch Histogram (Chitra's Model Feature Combination)
 import torch
 import os
 import dill
@@ -20,9 +20,9 @@ NUM_EPOCHS = 100
 PATIENCE = 15
 
 # ==========================================
-# DATASET GENERATION (MERT + X-VECTOR)
+# DATASET GENERATION (MERT + PITCH HISTOGRAM)
 # ==========================================
-class MERTXvectDataset(Dataset):
+class MERTPitchDataset(Dataset):
     def __init__(self, dill_path):
         with open(dill_path, 'rb') as f:
             self.data = dill.load(f)
@@ -33,17 +33,17 @@ class MERTXvectDataset(Dataset):
     def __getitem__(self, idx):
         item = self.data[idx]
         mert = torch.tensor(item['mert_embedding'], dtype=torch.float32)
-        xvect = torch.tensor(item['x_vector'], dtype=torch.float32)
+        ph = torch.tensor(item['pitch_histogram'], dtype=torch.float32).flatten()
         target = torch.tensor(item['ratings'][0], dtype=torch.float32)
         file_name = item['file_name'] 
-        return mert, xvect, target, file_name
+        return mert, ph, target, file_name
 
 # ==========================================
 # REGRESSION DENSE NETWORK
 # ==========================================
-class MERTXvectNet(nn.Module):
+class MERTPitchNet(nn.Module):
     def __init__(self):
-        super(MERTXvectNet, self).__init__()
+        super(MERTPitchNet, self).__init__()
         self.net = nn.Sequential(
             nn.LazyLinear(512),
             nn.BatchNorm1d(512),
@@ -56,9 +56,9 @@ class MERTXvectNet(nn.Module):
             nn.Linear(128, 1)
         )
 
-    def forward(self, mert, xvect):
-        # Simple concatenation of MERT and X-Vector
-        x = torch.cat([mert, xvect], dim=1)
+    def forward(self, mert, ph):
+        # Simple concatenation of MERT and Pitch Histogram
+        x = torch.cat([mert, ph], dim=1)
         return self.net(x)
 
 def extract_tensor(output):
@@ -79,31 +79,31 @@ def evaluate_metrics(targets, predictions):
 # ==========================================
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}\nRunning Combination: MERT + X-Vector", flush=True)
+    print(f"Using device: {device}\nRunning Combination: MERT + Pitch Histogram", flush=True)
 
     base_path = "/kaggle/input/notebooks/existentialnpc/createdill-ph/dill_data" 
     all_data = ConcatDataset([
-        MERTXvectDataset(os.path.join(base_path, "train.dill")),
-        MERTXvectDataset(os.path.join(base_path, "val.dill")),
-        MERTXvectDataset(os.path.join(base_path, "test.dill"))
+        MERTPitchDataset(os.path.join(base_path, "train.dill")),
+        MERTPitchDataset(os.path.join(base_path, "val.dill")),
+        MERTPitchDataset(os.path.join(base_path, "test.dill"))
     ])
     
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     fold_pearson, fold_spearman = [], []
-    save_dir = "./v14_mert_xvect_results"
+    save_dir = "./v15_mert_ph_results"
     os.makedirs(save_dir, exist_ok=True)
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(np.arange(len(all_data)))):
-        print(f"\n🚀 STARTING MERT + X-VECTOR FOLD {fold + 1}/5", flush=True)
+        print(f"\n🚀 STARTING MERT + PITCH HISTOGRAM FOLD {fold + 1}/5", flush=True)
 
         train_loader = DataLoader(Subset(all_data, train_idx), batch_size=BATCH_SIZE, shuffle=True)
         val_loader = DataLoader(Subset(all_data, val_idx), batch_size=1, shuffle=False)
 
-        model = MERTXvectNet().to(device)
+        model = MERTPitchNet().to(device)
         
         # Warmup lazy linear layers
-        d_mert, d_xvect, _, _ = next(iter(train_loader))
-        _ = model(d_mert.to(device), d_xvect.to(device))
+        d_mert, d_ph, _, _ = next(iter(train_loader))
+        _ = model(d_mert.to(device), d_ph.to(device))
         
         mse_loss = nn.MSELoss()
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
@@ -114,14 +114,14 @@ def main():
         for epoch in range(NUM_EPOCHS):
             model.train()
             total_loss = 0
-            for mert, xvect, targets, _ in train_loader:
-                mert, xvect = mert.to(device), xvect.to(device)
+            for mert, ph, targets, _ in train_loader:
+                mert, ph = mert.to(device), ph.to(device)
                 targets = (targets.to(device).view(-1, 1) - MIN_SCORE) / (MAX_SCORE - MIN_SCORE)
 
                 noise = torch.randn_like(targets) * 0.02
                 smooth_targets = torch.clamp(targets + noise, 0.0, 1.0)
 
-                out = extract_tensor(model(mert, xvect))[:, :1]
+                out = extract_tensor(model(mert, ph))[:, :1]
                 loss = mse_loss(out, smooth_targets)
 
                 optimizer.zero_grad()
@@ -133,10 +133,10 @@ def main():
             model.eval()
             v_preds, v_targets, v_filenames = [], [], []
             with torch.no_grad():
-                for mert, xvect, targets, f_names in val_loader:
-                    mert, xvect = mert.to(device), xvect.to(device)
+                for mert, ph, targets, f_names in val_loader:
+                    mert, ph = mert.to(device), ph.to(device)
                     targets_norm = (targets.to(device).view(-1, 1) - MIN_SCORE) / (MAX_SCORE - MIN_SCORE)
-                    out = extract_tensor(model(mert, xvect))[:, :1]
+                    out = extract_tensor(model(mert, ph))[:, :1]
                     v_preds.extend(out.cpu().numpy())
                     v_targets.extend(targets_norm.cpu().numpy())
                     v_filenames.extend(f_names)
@@ -148,7 +148,7 @@ def main():
                 best_val_pearson = v_p_corr
                 epochs_no_improve = 0
                 
-                torch.save(model.state_dict(), f"{save_dir}/best_mert_xvect_fold_{fold+1}.pth")
+                torch.save(model.state_dict(), f"{save_dir}/best_mert_ph_fold_{fold+1}.pth")
                 
                 true_scores = (np.array(v_targets).flatten() * (MAX_SCORE - MIN_SCORE)) + MIN_SCORE
                 pred_scores = (np.array(v_preds).flatten() * (MAX_SCORE - MIN_SCORE)) + MIN_SCORE
@@ -172,8 +172,8 @@ def main():
         print(f"✅ FOLD {fold+1} COMPLETE. Best Spearman: {best_val_spearman:.4f} (Pearson: {best_val_pearson:.4f})", flush=True)
 
     print("\n" + "X"*30)
-    print(f"🏆 MERT + X-VECTOR MEAN PEARSON: {np.mean(fold_pearson):.4f} (±{np.std(fold_pearson):.4f})")
-    print(f"🏆 MERT + X-VECTOR MEAN SPEARMAN: {np.mean(fold_spearman):.4f} (±{np.std(fold_spearman):.4f})")
+    print(f"🏆 MERT + PITCH HISTOGRAM MEAN PEARSON: {np.mean(fold_pearson):.4f} (±{np.std(fold_pearson):.4f})")
+    print(f"🏆 MERT + PITCH HISTOGRAM MEAN SPEARMAN: {np.mean(fold_spearman):.4f} (±{np.std(fold_spearman):.4f})")
     print("X"*30)
 
 if __name__ == "__main__":

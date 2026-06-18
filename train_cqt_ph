@@ -1,5 +1,5 @@
 # %% [code]
-# Version 16 - Huawei BiCA (MERT + X-Vector Ablation)
+# Version 17 - Huawei BiCA (MERT + Pitch Histogram Ablation)
 import torch
 import os
 import dill
@@ -22,7 +22,7 @@ PATIENCE = 15
 # ==========================================
 # DATASET GENERATION 
 # ==========================================
-class BiCADataset(Dataset):
+class BiCAMERTPitchDataset(Dataset):
     def __init__(self, dill_path):
         with open(dill_path, 'rb') as f:
             self.data = dill.load(f)
@@ -33,25 +33,26 @@ class BiCADataset(Dataset):
     def __getitem__(self, idx):
         item = self.data[idx]
         mert = torch.tensor(item['mert_embedding'], dtype=torch.float32)
-        xvect = torch.tensor(item['x_vector'], dtype=torch.float32)
+        # Flatten pitch histogram just like in V15
+        ph = torch.tensor(item['pitch_histogram'], dtype=torch.float32).flatten()
         target = torch.tensor(item['ratings'][0], dtype=torch.float32)
         file_name = item['file_name'] 
-        return mert, xvect, target, file_name
+        return mert, ph, target, file_name
 
 # ==========================================
-# HUAWEI BiCA NETWORK (2-FEATURE ABLATION)
+# HUAWEI BiCA NETWORK (MERT + PITCH HIST)
 # ==========================================
-class BiCAMERTXvectNet(nn.Module):
+class BiCAMERTPitchNet(nn.Module):
     def __init__(self, embed_dim=256, num_heads=4):
-        super(BiCAMERTXvectNet, self).__init__()
+        super(BiCAMERTPitchNet, self).__init__()
         
         # 1. Project features to same dimension for attention
         self.proj_mert = nn.Linear(768, embed_dim)
-        self.proj_xvect = nn.Linear(512, embed_dim)
+        self.proj_ph = nn.Linear(120, embed_dim) # Pitch Histogram is 120-dim
         
         # 2. Bi-directional Cross-Attention Layers
         self.attn_mert_q = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=0.2)
-        self.attn_xvect_q = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=0.2)
+        self.attn_ph_q = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True, dropout=0.2)
         
         # 3. Dense Regression Head
         self.net = nn.Sequential(
@@ -66,22 +67,22 @@ class BiCAMERTXvectNet(nn.Module):
             nn.Linear(128, 1)
         )
 
-    def forward(self, mert, xvect):
+    def forward(self, mert, ph):
         # Add sequence dimension for PyTorch MHA: (Batch, Seq_len=1, Embed_dim)
         p_mert = self.proj_mert(mert).unsqueeze(1)   
-        p_xvect = self.proj_xvect(xvect).unsqueeze(1) 
+        p_ph = self.proj_ph(ph).unsqueeze(1) 
         
-        # MERT queries X-Vector
-        attn_out_mert, _ = self.attn_mert_q(query=p_mert, key=p_xvect, value=p_xvect) 
-        # X-Vector queries MERT
-        attn_out_xvect, _ = self.attn_xvect_q(query=p_xvect, key=p_mert, value=p_mert)
+        # MERT queries Pitch Histogram
+        attn_out_mert, _ = self.attn_mert_q(query=p_mert, key=p_ph, value=p_ph) 
+        # Pitch Histogram queries MERT
+        attn_out_ph, _ = self.attn_ph_q(query=p_ph, key=p_mert, value=p_mert)
         
         # Remove sequence dimension
         feat_mert = attn_out_mert.squeeze(1)
-        feat_xvect = attn_out_xvect.squeeze(1)
+        feat_ph = attn_out_ph.squeeze(1)
         
         # Fuse and predict
-        fused = torch.cat([feat_mert, feat_xvect], dim=1) 
+        fused = torch.cat([feat_mert, feat_ph], dim=1) 
         return self.net(fused)
 
 def extract_tensor(output):
@@ -102,18 +103,18 @@ def evaluate_metrics(targets, predictions):
 # ==========================================
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}\nRunning Combination: BiCA (MERT + X-Vector)", flush=True)
+    print(f"Using device: {device}\nRunning Combination: BiCA (MERT + Pitch Histogram)", flush=True)
 
     base_path = "/kaggle/input/notebooks/existentialnpc/createdill-ph/dill_data" 
     all_data = ConcatDataset([
-        BiCADataset(os.path.join(base_path, "train.dill")),
-        BiCADataset(os.path.join(base_path, "val.dill")),
-        BiCADataset(os.path.join(base_path, "test.dill"))
+        BiCAMERTPitchDataset(os.path.join(base_path, "train.dill")),
+        BiCAMERTPitchDataset(os.path.join(base_path, "val.dill")),
+        BiCAMERTPitchDataset(os.path.join(base_path, "test.dill"))
     ])
     
     kf = KFold(n_splits=5, shuffle=True, random_state=42)
     fold_pearson, fold_spearman = [], []
-    save_dir = "./v16_bica_mert_xvect_results"
+    save_dir = "./v17_bica_mert_ph_results"
     os.makedirs(save_dir, exist_ok=True)
 
     for fold, (train_idx, val_idx) in enumerate(kf.split(np.arange(len(all_data)))):
@@ -122,11 +123,11 @@ def main():
         train_loader = DataLoader(Subset(all_data, train_idx), batch_size=BATCH_SIZE, shuffle=True)
         val_loader = DataLoader(Subset(all_data, val_idx), batch_size=1, shuffle=False)
 
-        model = BiCAMERTXvectNet().to(device)
+        model = BiCAMERTPitchNet().to(device)
         
         # Warmup lazy linear layers
-        d_mert, d_xvect, _, _ = next(iter(train_loader))
-        _ = model(d_mert.to(device), d_xvect.to(device))
+        d_mert, d_ph, _, _ = next(iter(train_loader))
+        _ = model(d_mert.to(device), d_ph.to(device))
         
         mse_loss = nn.MSELoss()
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
@@ -137,14 +138,14 @@ def main():
         for epoch in range(NUM_EPOCHS):
             model.train()
             total_loss = 0
-            for mert, xvect, targets, _ in train_loader:
-                mert, xvect = mert.to(device), xvect.to(device)
+            for mert, ph, targets, _ in train_loader:
+                mert, ph = mert.to(device), ph.to(device)
                 targets = (targets.to(device).view(-1, 1) - MIN_SCORE) / (MAX_SCORE - MIN_SCORE)
 
                 noise = torch.randn_like(targets) * 0.02
                 smooth_targets = torch.clamp(targets + noise, 0.0, 1.0)
 
-                out = extract_tensor(model(mert, xvect))[:, :1]
+                out = extract_tensor(model(mert, ph))[:, :1]
                 loss = mse_loss(out, smooth_targets)
 
                 optimizer.zero_grad()
@@ -156,10 +157,10 @@ def main():
             model.eval()
             v_preds, v_targets, v_filenames = [], [], []
             with torch.no_grad():
-                for mert, xvect, targets, f_names in val_loader:
-                    mert, xvect = mert.to(device), xvect.to(device)
+                for mert, ph, targets, f_names in val_loader:
+                    mert, ph = mert.to(device), ph.to(device)
                     targets_norm = (targets.to(device).view(-1, 1) - MIN_SCORE) / (MAX_SCORE - MIN_SCORE)
-                    out = extract_tensor(model(mert, xvect))[:, :1]
+                    out = extract_tensor(model(mert, ph))[:, :1]
                     v_preds.extend(out.cpu().numpy())
                     v_targets.extend(targets_norm.cpu().numpy())
                     v_filenames.extend(f_names)
@@ -195,8 +196,8 @@ def main():
         print(f"✅ FOLD {fold+1} COMPLETE. Best Spearman: {best_val_spearman:.4f} (Pearson: {best_val_pearson:.4f})", flush=True)
 
     print("\n" + "X"*30)
-    print(f"🏆 BiCA (MERT + X-VECTOR) MEAN PEARSON: {np.mean(fold_pearson):.4f} (±{np.std(fold_pearson):.4f})")
-    print(f"🏆 BiCA (MERT + X-VECTOR) MEAN SPEARMAN: {np.mean(fold_spearman):.4f} (±{np.std(fold_spearman):.4f})")
+    print(f"🏆 BiCA (MERT + PITCH HISTOGRAM) MEAN PEARSON: {np.mean(fold_pearson):.4f} (±{np.std(fold_pearson):.4f})")
+    print(f"🏆 BiCA (MERT + PITCH HISTOGRAM) MEAN SPEARMAN: {np.mean(fold_spearman):.4f} (±{np.std(fold_spearman):.4f})")
     print("X"*30)
 
 if __name__ == "__main__":
